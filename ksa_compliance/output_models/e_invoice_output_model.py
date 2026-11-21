@@ -21,7 +21,7 @@ from frappe.utils import flt
 from .service import get_right_fieldname, update_result
 from .prepayment_invoice.prepayment_invoice_factory import prepayment_invoice_factory_create
 
-from .tax import create_tax_categories, create_allowance_charge, create_tax_total
+from .tax import create_tax_categories, create_allowance_charge, create_tax_total, TaxCorrection
 
 
 class Einvoice:
@@ -31,6 +31,7 @@ class Einvoice:
         invoice_type: InvoiceType = 'Simplified',
     ):
         self.additional_fields_doc = sales_invoice_additional_fields_doc
+        self.tax_corrections = cast(list[TaxCorrection], [])
         self.result = {
             'invoice': {},
             'business_settings': {},
@@ -900,7 +901,14 @@ class Einvoice:
         )
         self.append_to_item_lines(item_lines, is_tax_included, self.sales_invoice_doc)
         tax_categories = create_tax_categories(self.sales_invoice_doc, item_lines, is_tax_included)
-        tax_total = create_tax_total(tax_categories)
+        # Anchor the VAT breakdown on the invoice-level VAT so BT-110 and Σ BT-117 agree (BR-CO-14).
+        # Payment Entry is excluded: its total is adjusted further below for non-'Actual' charge
+        # types, so the figure rendered as BT-110 is not the one available here.
+        invoice_total_vat = None
+        if self.sales_invoice_doc.doctype != 'Payment Entry':
+            invoice_total_vat = abs(flt(self.sales_invoice_doc.total_taxes_and_charges or 0.0))
+        tax_total, tax_corrections = create_tax_total(tax_categories, invoice_total_vat)
+        self.tax_corrections = tax_corrections
         self.result['invoice']['tax_total'] = tax_total
         allowance_charge = create_allowance_charge(self.sales_invoice_doc, tax_total)
         self.result['invoice']['allowance_charge'] = allowance_charge

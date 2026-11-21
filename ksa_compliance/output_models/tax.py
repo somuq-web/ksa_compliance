@@ -1,7 +1,9 @@
+from dataclasses import dataclass
 from math import copysign
+from typing import Tuple
 
 import frappe
-from frappe.utils import rounded
+from frappe.utils import flt, rounded
 
 from ksa_compliance.standard_doctypes.tax_category import map_tax_category
 from .service import get_right_fieldname, dataclass_to_frappe_dict
@@ -94,27 +96,115 @@ def check_item_tax_template(doc: SalesInvoice, item_lines: list, sales_taxes_and
         )
 
 
-def create_tax_total(tax_categories: dict) -> dict:
-    tax_sub_totals = []
+# When calculating tax subtotals (tax amount per tax category), we sum up line-level taxes for each category. The sum of
+# subtotals should equal the total taxes and charges. However, we sometimes get a mismatch due to floating point
+# rounding. This constant describes the maximum drift we allow per line while still considering the invoice to be
+# correct. I.e., If we have four lines across two categories, we allow for up to 0.04 difference between the sum of
+# subtotals and the total taxes and charges, and correct the tax subtotals (see [_allocate_tax_amounts] below)
+# If we get a difference larger than expected (0.04 in this example), it means we have a problem that's not related to
+# rounding, and we do not attempt to correct the subtotals.
+MAX_ROUNDING_DRIFT_PER_LINE = 0.01
+
+
+@dataclass
+class TaxCorrection:
+    category: str
+    before: float
+    after: float
+
+
+def create_tax_total(
+    tax_categories: dict, total_taxes_and_charges: float | None = None
+) -> Tuple[frappe._dict, list[TaxCorrection]]:
+    """Build the invoice's VAT breakdown (``cac:TaxTotal``).
+
+    Line-level VAT comes from `Sales Invoice Item.tax_amount`, which the Saudi regional override
+    recomputes per line as `flt(net_amount * rate / 100, precision)`. Rounding each line
+    independently means sum(line VAT) can drift a few halalas away from `total_taxes_and_charges`.
+
+    When we detect such drift, we recalculate subtotals and allocate the error amount (difference between expected and
+    actual) into one of the subtotals. This is a workaround/hack, and it will fall apart if/when ZATCA compares
+    line-level VAT to category subtotals.
+
+    A gap too wide to be rounding is left alone; see [MAX_ROUNDING_DRIFT_PER_LINE].
+    """
+    amounts_by_category = {key: _get_amounts(tax_categories[key]) for key in tax_categories}
+    corrected_tax_amounts_by_category = _allocate_tax_amounts(
+        tax_categories, amounts_by_category, total_taxes_and_charges
+    )
+
+    tax_corrections: list[TaxCorrection] = []
+    tax_sub_totals: list[TaxSubtotal] = []
     tax_amount = 0
     taxable_amount = 0
     total_discount = 0
-    for key in tax_categories:
-        amounts = _get_amounts(tax_categories[key])
+    for category in tax_categories:
+        amounts = amounts_by_category[category]
+        corrected_tax_amount = corrected_tax_amounts_by_category[category]
         tax_sub_total = TaxSubtotal(
             taxable_amount=amounts.taxable_amount,
-            tax_amount=amounts.tax_amount,
-            tax_category=tax_categories[key].tax_category,
+            tax_amount=corrected_tax_amount,
+            tax_category=tax_categories[category].tax_category,
             total_discount=amounts.total_discount,
         )
-        tax_amount += amounts.tax_amount
+        tax_amount += tax_sub_total.tax_amount
         taxable_amount += amounts.taxable_amount
         total_discount += amounts.total_discount
         tax_sub_totals.append(tax_sub_total)
 
-    return dataclass_to_frappe_dict(
+        if amounts.tax_amount != corrected_tax_amount:
+            tax_corrections.append(TaxCorrection(category, amounts.tax_amount, corrected_tax_amount))
+
+    tax_total = dataclass_to_frappe_dict(
         TaxTotal(tax_amount=tax_amount, taxable_amount=taxable_amount, tax_subtotal=tax_sub_totals)
     )
+    return tax_total, tax_corrections
+
+
+def _allocate_tax_amounts(
+    tax_categories: dict, amounts_by_category: dict, total_taxes_and_charges: float | None
+) -> dict:
+    """Decide the VAT amount (BT-117) of each tax category. See [create_tax_total] for the rules."""
+    line_amounts = {category: amounts_by_category[category].tax_amount for category in tax_categories}
+    if total_taxes_and_charges is None:
+        return line_amounts
+
+    # We round with 2-digit precision to match e_invoice.xml
+    target = flt(total_taxes_and_charges, 2)
+    if flt(target - sum(line_amounts.values()), 2) == 0.0:
+        return line_amounts
+
+    expected_amount_by_category = {
+        category: flt(
+            amounts_by_category[category].taxable_amount
+            * flt(tax_categories[category].tax_category.percent or 0.0)
+            / 100,
+            2,
+        )
+        for category in tax_categories
+    }
+    expected_total = sum(expected_amount_by_category.values())
+    if not expected_total:
+        return line_amounts
+
+    line_count = sum(len(tax_categories[category].items) for category in tax_categories)
+    # Both sides are rounded: a gap of exactly one halala per line is still rounding, and an
+    # unrounded float difference such as 1.31 - 1.30 = 0.010000000000000009 would exceed it.
+    max_drift = flt(MAX_ROUNDING_DRIFT_PER_LINE * line_count, 2)
+    if flt(abs(target - expected_total), 2) > max_drift:
+        return line_amounts
+
+    # The residue from rounding each share goes to the category carrying the most VAT
+    # We recalculate all categories except the maximum one, which we assign the difference between the target VAT and
+    # the sum of recalculated subtotals
+    max_category: str = max(expected_amount_by_category)
+    result: dict[str, float] = {
+        category: flt(target * expected_amount_by_category[category] / expected_total, 2)
+        for category in tax_categories
+        if category != max_category
+    }
+    result[max_category] = flt(target - sum(result.values()), 2)
+    return result
 
 
 def _get_amounts(tax_category: TaxCategoryByItems) -> frappe._dict:
